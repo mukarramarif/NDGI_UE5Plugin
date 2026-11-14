@@ -2,7 +2,7 @@
 	"FileVersion": 3,
 	"EngineAssociation": "5.8",
 	"Category": "",
-	"Description": "NDGI demo project with Isometric World and Niagara Bistro assets",
+	"Description": "NDGI plugin development project",
 	"Plugins": [
 		{
 			"Name": "GPULightmass",
