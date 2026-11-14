@@ -1,0 +1,176 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGIMLP.ush
+	Shared device-side MLP for NDGI (arXiv 2604.12625):
+	16 -> HIDDEN (GELU) -> HIDDEN (GELU) -> 6 (linear).
+	Outputs 0..2 are normalized RGB, outputs 3..5 are normalized SH.xyz.
+
+	Parameter buffer layout (must match NDGI::Reference flattening order):
+		W1 [IN*H] | B1 [H] | W2 [H*H] | B2 [H] | W3 [OUT*H] | B3 [OUT]
+=============================================================================*/
+
+#pragma once
+
+#define NDGI_INPUT_DIM 16
+#define NDGI_HIDDEN_DIM 16
+#define NDGI_OUTPUT_DIM 6
+
+#define NDGI_W1_OFFSET 0
+#define NDGI_B1_OFFSET (NDGI_HIDDEN_DIM * NDGI_INPUT_DIM)
+#define NDGI_W2_OFFSET (NDGI_B1_OFFSET + NDGI_HIDDEN_DIM)
+#define NDGI_B2_OFFSET (NDGI_W2_OFFSET + NDGI_HIDDEN_DIM * NDGI_HIDDEN_DIM)
+#define NDGI_W3_OFFSET (NDGI_B2_OFFSET + NDGI_HIDDEN_DIM)
+#define NDGI_B3_OFFSET (NDGI_W3_OFFSET + NDGI_OUTPUT_DIM * NDGI_HIDDEN_DIM)
+#define NDGI_NUM_PARAMETERS (NDGI_B3_OFFSET + NDGI_OUTPUT_DIM)
+
+#define NDGI_INPUT_GRAD_COUNT 16
+#define NDGI_SAMPLE_GRAD_COUNT (NDGI_NUM_PARAMETERS + NDGI_INPUT_GRAD_COUNT)
+
+// Training loss weights. SH is weighted above RGB so tile-edge directional
+// errors are not dominated by the (already high-PSNR) color channels.
+#define NDGI_OUTPUT_WEIGHT_RGB 1.0f
+#define NDGI_OUTPUT_WEIGHT_SH 4.0f
+
+float NDGIOutputWeight(uint Index)
+{
+	return Index < 3u ? NDGI_OUTPUT_WEIGHT_RGB : NDGI_OUTPUT_WEIGHT_SH;
+}
+
+// erf approximation (Abramowitz-Stegun 7.1.26, |error| < 1.5e-7).
+// DXC does not expose an erf intrinsic; this matches the CPU's std::erf closely
+// enough for kernel validation (tolerances are 1e-3 relative).
+float NDGIErf(float X)
+{
+	const float Sign = (X >= 0.0f) ? 1.0f : -1.0f;
+	const float AbsX = abs(X);
+	const float T = 1.0f / (1.0f + 0.3275911f * AbsX);
+	const float Poly = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f))));
+	const float Approx = 1.0f - Poly * exp(-AbsX * AbsX);
+	return Sign * Approx;
+}
+
+// Exact (erf-based) GELU, matching the CPU reference.
+float NDGIGelu(float X)
+{
+	return 0.5f * X * (1.0f + NDGIErf(X * 0.7071067811865475f));
+}
+
+float NDGIGeluDerivative(float X)
+{
+	return 0.5f * (1.0f + NDGIErf(X * 0.7071067811865475f)) + X * exp(-0.5f * X * X) * 0.3989422804014327f;
+}
+
+struct NDGIMLPForwardCache
+{
+	float H1Pre[NDGI_HIDDEN_DIM];
+	float H1[NDGI_HIDDEN_DIM];
+	float H2Pre[NDGI_HIDDEN_DIM];
+	float H2[NDGI_HIDDEN_DIM];
+	float Output[NDGI_OUTPUT_DIM];
+};
+
+void NDGIMLPForward(uint ParameterBase, StructuredBuffer<float> Parameters, float Inputs[NDGI_INPUT_DIM], out NDGIMLPForwardCache Cache)
+{
+	[unroll]
+	for (int Row = 0; Row < NDGI_HIDDEN_DIM; ++Row)
+	{
+		float Sum = Parameters[ParameterBase + NDGI_B1_OFFSET + Row];
+		[unroll]
+		for (int Col = 0; Col < NDGI_INPUT_DIM; ++Col)
+		{
+			Sum += Parameters[ParameterBase + NDGI_W1_OFFSET + Row * NDGI_INPUT_DIM + Col] * Inputs[Col];
+		}
+		Cache.H1Pre[Row] = Sum;
+		Cache.H1[Row] = NDGIGelu(Sum);
+	}
+
+	[unroll]
+	for (int Row2 = 0; Row2 < NDGI_HIDDEN_DIM; ++Row2)
+	{
+		float Sum = Parameters[ParameterBase + NDGI_B2_OFFSET + Row2];
+		[unroll]
+		for (int Col2 = 0; Col2 < NDGI_HIDDEN_DIM; ++Col2)
+		{
+			Sum += Parameters[ParameterBase + NDGI_W2_OFFSET + Row2 * NDGI_HIDDEN_DIM + Col2] * Cache.H1[Col2];
+		}
+		Cache.H2Pre[Row2] = Sum;
+		Cache.H2[Row2] = NDGIGelu(Sum);
+	}
+
+	[unroll]
+	for (int Row3 = 0; Row3 < NDGI_OUTPUT_DIM; ++Row3)
+	{
+		float Sum = Parameters[ParameterBase + NDGI_B3_OFFSET + Row3];
+		[unroll]
+		for (int Col3 = 0; Col3 < NDGI_HIDDEN_DIM; ++Col3)
+		{
+			Sum += Parameters[ParameterBase + NDGI_W3_OFFSET + Row3 * NDGI_HIDDEN_DIM + Col3] * Cache.H2[Col3];
+		}
+		Cache.Output[Row3] = Sum;
+	}
+}
+
+// Accumulates parameter and input gradients for one sample (caller must zero both arrays).
+void NDGIMLPBackward(
+	uint ParameterBase,
+	StructuredBuffer<float> Parameters,
+	float Inputs[NDGI_INPUT_DIM],
+	NDGIMLPForwardCache Cache,
+	float OutputGradients[NDGI_OUTPUT_DIM],
+	inout float ParameterGradients[NDGI_NUM_PARAMETERS],
+	inout float InputGradients[NDGI_INPUT_DIM])
+{
+	float DHidden2[NDGI_HIDDEN_DIM];
+	[unroll]
+	for (int Init2 = 0; Init2 < NDGI_HIDDEN_DIM; ++Init2)
+	{
+		DHidden2[Init2] = 0.0f;
+	}
+
+	[unroll]
+	for (int Row = 0; Row < NDGI_OUTPUT_DIM; ++Row)
+	{
+		const float DOutput = OutputGradients[Row];
+		ParameterGradients[NDGI_B3_OFFSET + Row] += DOutput;
+		[unroll]
+		for (int Col = 0; Col < NDGI_HIDDEN_DIM; ++Col)
+		{
+			ParameterGradients[NDGI_W3_OFFSET + Row * NDGI_HIDDEN_DIM + Col] += DOutput * Cache.H2[Col];
+			DHidden2[Col] += DOutput * Parameters[ParameterBase + NDGI_W3_OFFSET + Row * NDGI_HIDDEN_DIM + Col];
+		}
+	}
+
+	float DHidden1[NDGI_HIDDEN_DIM];
+	[unroll]
+	for (int Init1 = 0; Init1 < NDGI_HIDDEN_DIM; ++Init1)
+	{
+		DHidden1[Init1] = 0.0f;
+	}
+
+	[unroll]
+	for (int Row2 = 0; Row2 < NDGI_HIDDEN_DIM; ++Row2)
+	{
+		const float DPre = DHidden2[Row2] * NDGIGeluDerivative(Cache.H2Pre[Row2]);
+		ParameterGradients[NDGI_B2_OFFSET + Row2] += DPre;
+		[unroll]
+		for (int Col2 = 0; Col2 < NDGI_HIDDEN_DIM; ++Col2)
+		{
+			ParameterGradients[NDGI_W2_OFFSET + Row2 * NDGI_HIDDEN_DIM + Col2] += DPre * Cache.H1[Col2];
+			DHidden1[Col2] += DPre * Parameters[ParameterBase + NDGI_W2_OFFSET + Row2 * NDGI_HIDDEN_DIM + Col2];
+		}
+	}
+
+	[unroll]
+	for (int Row3 = 0; Row3 < NDGI_HIDDEN_DIM; ++Row3)
+	{
+		const float DPre = DHidden1[Row3] * NDGIGeluDerivative(Cache.H1Pre[Row3]);
+		ParameterGradients[NDGI_B1_OFFSET + Row3] += DPre;
+		[unroll]
+		for (int Col3 = 0; Col3 < NDGI_INPUT_DIM; ++Col3)
+		{
+			ParameterGradients[NDGI_W1_OFFSET + Row3 * NDGI_INPUT_DIM + Col3] += DPre * Inputs[Col3];
+			InputGradients[Col3] += DPre * Parameters[ParameterBase + NDGI_W1_OFFSET + Row3 * NDGI_INPUT_DIM + Col3];
+		}
+	}
+}

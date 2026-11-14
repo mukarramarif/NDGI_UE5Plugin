@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGIMLPBackward.usf
+	Per-sample MLP backward pass for kernel validation against the CPU reference.
+	Writes, per sample: [NDGI_NUM_PARAMETERS parameter gradients][16 input gradients].
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+#include "NDGIMLP.ush"
+
+StructuredBuffer<float> MLPParameters;
+StructuredBuffer<float> SampleInputs;
+StructuredBuffer<float> SampleTargets;
+RWStructuredBuffer<float> SampleGradients;
+uint NumSamples;
+
+[numthreads(64, 1, 1)]
+void BackwardMainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint SampleIndex = DispatchThreadId.x;
+	if (SampleIndex >= NumSamples)
+	{
+		return;
+	}
+
+	float SampleInput[NDGI_INPUT_DIM];
+	[unroll]
+	for (int k = 0; k < NDGI_INPUT_DIM; ++k)
+	{
+		SampleInput[k] = SampleInputs[SampleIndex * NDGI_INPUT_DIM + k];
+	}
+
+	NDGIMLPForwardCache Cache;
+	NDGIMLPForward(0u, MLPParameters, SampleInput, Cache);
+
+	float OutputGradients[NDGI_OUTPUT_DIM];
+	[unroll]
+	for (int j = 0; j < NDGI_OUTPUT_DIM; ++j)
+	{
+		OutputGradients[j] = 2.0f * NDGIOutputWeight((uint)j)
+			* (Cache.Output[j] - SampleTargets[SampleIndex * NDGI_OUTPUT_DIM + j]);
+	}
+
+	float ParameterGradients[NDGI_NUM_PARAMETERS];
+	for (int p = 0; p < NDGI_NUM_PARAMETERS; ++p)
+	{
+		ParameterGradients[p] = 0.0f;
+	}
+
+	float InputGradients[NDGI_INPUT_DIM];
+	[unroll]
+	for (int g = 0; g < NDGI_INPUT_DIM; ++g)
+	{
+		InputGradients[g] = 0.0f;
+	}
+
+	NDGIMLPBackward(0u, MLPParameters, SampleInput, Cache, OutputGradients, ParameterGradients, InputGradients);
+
+	const uint Base = SampleIndex * NDGI_SAMPLE_GRAD_COUNT;
+	for (int p2 = 0; p2 < NDGI_NUM_PARAMETERS; ++p2)
+	{
+		SampleGradients[Base + p2] = ParameterGradients[p2];
+	}
+	[unroll]
+	for (int g2 = 0; g2 < NDGI_INPUT_DIM; ++g2)
+	{
+		SampleGradients[Base + NDGI_NUM_PARAMETERS + g2] = InputGradients[g2];
+	}
+}

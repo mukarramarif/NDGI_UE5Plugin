@@ -1,0 +1,259 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGIDecodeAtlas.usf
+	Decodes every tile of one lightmap atlas at a given time and writes the
+	result back in the engine's HQ lightmap log encoding.
+
+	Layout: the top half of the atlas holds coefficient 0, the bottom half holds
+	coefficient 1 (LightmapUV1 = LightmapUV0 + float2(0, 0.5)). The MLP predicts
+	RGB (outputs 0..2) and signed SH (outputs 3..5); SH.xyz is written into
+	coefficient 1 while alpha is encoded for SH.w = 1/sqrt(4*pi), the engine's
+	constant directional-SH basis term (non-directional tiles keep SH.w = 1).
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+#include "NDGICompactTile.ush"
+
+StructuredBuffer<float> TileParameters;
+StructuredBuffer<uint> TileModelIndices;
+Texture2DArray<float4> FeatureUVTexture;
+Texture2DArray<float4> FeatureUVTTexture;
+// Four float4 entries per encoding range: Scale0, Add0, Scale1, Add1.
+StructuredBuffer<float4> EncodingRanges;
+// Four uint8 range indices packed per uint, row-major over the coefficient-0 half.
+StructuredBuffer<uint> EncodingIndices;
+Texture2D<float4> SourceTexture;
+RWTexture2D<float4> OutputTexture;
+
+uint AtlasWidth;
+uint AtlasHeight;
+uint TileSize;
+uint OverlapTexels;
+uint GridX;
+uint GridY;
+uint TimeSlices;
+uint TotalParams;
+uint bHighQuality;
+
+float Time;
+float3 MeanRGB;
+float3 MeanSH;
+uint bDirectionalSH;
+uint bHasEncodingRanges;
+float Gamma;
+
+// NDGITileParameters members (bound by bare leaf names).
+uint UVSize;
+uint UVTSize;
+uint UTSize;
+uint VTSize;
+uint LayoutTimeSlices;
+uint MLPOffset;
+uint UTOffset;
+uint VTOffset;
+
+/** Evaluates one tile model at model-local (u, v, time), returning normalized RGB and SH. */
+void NDGIEvaluateModel(
+	uint Base,
+	uint ModelSlot,
+	NDGICompactTileParameters TileParams,
+	float U, float V, float InTime,
+	out float3 OutRGB, out float3 OutSH)
+{
+	float Vuv[4], Vut[2], Vvt[2], Vuvt[4];
+	NDGICompactSampleTile(Base, TileParams, TileParameters,
+		FeatureUVTexture, FeatureUVTTexture, ModelSlot, U, V, InTime, Vuv, Vut, Vvt, Vuvt);
+
+	float Input[NDGI_INPUT_DIM];
+	[unroll]
+	for (uint c = 0; c < 4; ++c)
+	{
+		Input[c] = Vuv[c];
+		Input[8 + c] = Vuvt[c];
+	}
+	Input[4] = Vut[0];
+	Input[5] = Vut[1];
+	Input[6] = Vvt[0];
+	Input[7] = Vvt[1];
+	Input[12] = sin(2.0 * PI * InTime);
+	Input[13] = cos(2.0 * PI * InTime);
+	Input[14] = sin(4.0 * PI * InTime);
+	Input[15] = cos(4.0 * PI * InTime);
+
+	NDGIMLPForwardCache Cache;
+	NDGIMLPForward(Base + MLPOffset, TileParameters, Input, Cache);
+	OutRGB = float3(Cache.Output[0], Cache.Output[1], Cache.Output[2]);
+	OutSH = float3(Cache.Output[3], Cache.Output[4], Cache.Output[5]);
+}
+
+[numthreads(8, 8, 1)]
+void DecodeAtlasCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint X = DispatchThreadId.x;
+	const uint Y = DispatchThreadId.y;
+	const uint CoefHeight = AtlasHeight / 2;
+	if (X >= AtlasWidth || Y >= CoefHeight)
+	{
+		return;
+	}
+
+	NDGICompactTileParameters TileParams;
+	TileParams.UVSize = UVSize;
+	TileParams.UVTSize = UVTSize;
+	TileParams.UTSize = UTSize;
+	TileParams.VTSize = VTSize;
+	TileParams.TimeSlices = LayoutTimeSlices;
+	TileParams.MLPOffset = MLPOffset;
+	TileParams.UTOffset = UTOffset;
+	TileParams.VTOffset = VTOffset;
+
+	const int PX = (int)X;
+	const int PY = (int)Y;
+	const int TileX = PX / (int)TileSize;
+	const int TileY = PY / (int)TileSize;
+	if (TileX < 0 || TileX >= (int)GridX || TileY < 0 || TileY >= (int)GridY)
+	{
+		return;
+	}
+
+	// Tiles without a model keep their baked content.
+	const uint OwnModelIndex = TileModelIndices[(uint)TileY * GridX + (uint)TileX];
+	if (OwnModelIndex == 0xFFFFFFFFu)
+	{
+		OutputTexture[uint2(X, Y)] = SourceTexture.Load(int3(PX, PY, 0));
+		OutputTexture[uint2(X, Y + CoefHeight)] = SourceTexture.Load(int3(PX, PY + (int)CoefHeight, 0));
+		return;
+	}
+
+	// Per-component HQ range. 255 means no component owns this texel (atlas
+	// padding); preserve the baked value instead of decoding it.
+	const uint FlatTexel = (uint)PY * AtlasWidth + (uint)PX;
+	uint RangeIndex = 0;
+	if (bHasEncodingRanges != 0)
+	{
+		const uint PackedIndices = EncodingIndices[FlatTexel >> 2];
+		RangeIndex = (PackedIndices >> ((FlatTexel & 3) * 8)) & 0xFFu;
+		if (RangeIndex == 255u)
+		{
+			OutputTexture[uint2(X, Y)] = SourceTexture.Load(int3(PX, PY, 0));
+			OutputTexture[uint2(X, Y + CoefHeight)] = SourceTexture.Load(int3(PX, PY + (int)CoefHeight, 0));
+			return;
+		}
+	}
+
+	// Overlapping inference: every model whose extent covers this texel contributes,
+	// weighted by its distance to the extent edge. Each model covers its core plus
+	// OverlapTexels on every side, and is trained on that same expanded region.
+	const int Overlap = (int)OverlapTexels;
+	const int Extent = (int)TileSize + 2 * Overlap;
+	float3 SumRGB = float3(0.0, 0.0, 0.0);
+	float3 SumSH = float3(0.0, 0.0, 0.0);
+	float WeightSum = 0.0;
+
+	[loop]
+	for (int DY = -1; DY <= 1; ++DY)
+	{
+		const int NY = TileY + DY;
+		if (NY < 0 || NY >= (int)GridY)
+		{
+			continue;
+		}
+		[loop]
+		for (int DX = -1; DX <= 1; ++DX)
+		{
+			const int NX = TileX + DX;
+			if (NX < 0 || NX >= (int)GridX)
+			{
+				continue;
+			}
+			const uint NeighborModel = TileModelIndices[(uint)NY * GridX + (uint)NX];
+			if (NeighborModel == 0xFFFFFFFFu)
+			{
+				continue;
+			}
+
+			const int OriginX = NX * (int)TileSize - Overlap;
+			const int OriginY = NY * (int)TileSize - Overlap;
+			if (PX < OriginX || PX >= OriginX + Extent || PY < OriginY || PY >= OriginY + Extent)
+			{
+				continue;
+			}
+
+			const float LX = (float)(PX - OriginX) + 0.5;
+			const float LY = (float)(PY - OriginY) + 0.5;
+			float WX = 1.0;
+			float WY = 1.0;
+			if (Overlap > 0)
+			{
+				// 1 inside the model's core, tapering to 0 at its extent edge.
+				WX = saturate(min(LX, (float)Extent - LX) / (float)Overlap);
+				WY = saturate(min(LY, (float)Extent - LY) / (float)Overlap);
+			}
+			const float Weight = WX * WY;
+			if (Weight <= 0.0)
+			{
+				continue;
+			}
+
+			float3 ModelRGB;
+			float3 ModelSH;
+			NDGIEvaluateModel(
+				NeighborModel * TotalParams, NeighborModel, TileParams,
+				LX / (float)Extent, LY / (float)Extent, Time,
+				ModelRGB, ModelSH);
+			SumRGB += Weight * ModelRGB;
+			SumSH += Weight * ModelSH;
+			WeightSum += Weight;
+		}
+	}
+
+	if (WeightSum <= 0.0)
+	{
+		OutputTexture[uint2(X, Y)] = float4(0.0, 0.0, 0.0, 1.0);
+		OutputTexture[uint2(X, Y + CoefHeight)] = float4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+
+	const float3 Normalized = SumRGB / WeightSum;
+	const float3 SHNormalized = SumSH / WeightSum;
+	const float3 Linear = pow(max(Normalized + MeanRGB, 0.0), Gamma);
+
+	// HQ encode (inverse of GetLightMapColorHQ).
+	const float L = max(dot(Linear, float3(0.3, 0.59, 0.11)), 1e-4);
+	const float LogL = log2(L + 0.01858136);
+	const float3 UVW = Linear / L;
+
+	const float3 SH = bDirectionalSH != 0
+		? SHNormalized + MeanSH
+		: float3(0.0, 0.0, 0.0);
+
+	const float4 RangeScale0 = EncodingRanges[RangeIndex * 4 + 0];
+	const float4 RangeAdd0 = EncodingRanges[RangeIndex * 4 + 1];
+	const float4 RangeScale1 = EncodingRanges[RangeIndex * 4 + 2];
+	const float4 RangeAdd1 = EncodingRanges[RangeIndex * 4 + 3];
+
+	// Near-uniform lightmap regions get an almost-zero RGB scale from Lightmass.
+	// No neural prediction can resolve chroma at that precision, so keep the
+	// baked chroma and drive only luminance through the alpha channel. Only read
+	// the source texel in that rare case.
+	const bool bDegenerateColorRange = max(max(RangeScale0.r, RangeScale0.g), RangeScale0.b) < 1e-4;
+	float3 FinalUVW = UVW;
+	if (bDegenerateColorRange)
+	{
+		const float4 SourceTop = SourceTexture.Load(int3(PX, PY, 0));
+		FinalUVW = SourceTop.rgb * SourceTop.rgb * RangeScale0.rgb + RangeAdd0.rgb;
+	}
+
+	const float3 Raw0RGB = sqrt(max((FinalUVW - RangeAdd0.rgb) / RangeScale0.rgb, 0.0));
+	const float3 Raw1RGB = (SH - RangeAdd1.rgb) / RangeScale1.rgb;
+	// The engine's directional lightmap SH vector uses 1/sqrt(4*pi) as its
+	// constant basis term. Tiles without SH keep the legacy (0,0,0,1) vector.
+	const float SHConstant = bDirectionalSH != 0 ? 0.2820947918 : 1.0;
+	const float Raw1A = (SHConstant - RangeAdd1.w) / RangeScale1.w;
+	const float Residual = Raw1A / 255.0 - 0.5 / 255.0;
+	const float Raw0A = (LogL - RangeAdd0.w) / RangeScale0.w - Residual;
+
+	OutputTexture[uint2(X, Y)] = float4(saturate(Raw0RGB), saturate(Raw0A));
+	OutputTexture[uint2(X, Y + CoefHeight)] = float4(saturate(Raw1RGB), saturate(Raw1A));
+}

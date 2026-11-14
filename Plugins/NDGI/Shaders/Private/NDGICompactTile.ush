@@ -1,0 +1,172 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGICompactTile.ush
+	Runtime sampling for the BC7 feature representation.
+
+	The large F_uv and F_uvt feature maps live in Texture2DArrays:
+	  FeatureUVTexture  : one layer per tile model
+	  FeatureUVTTexture : TimeSlices layers per tile model, model-major
+
+	Only the small F_ut/F_vt planes and the MLP remain in the flat
+	StructuredBuffer. BC7 hardware decode supplies the feature texels, so the
+	shader no longer expands endpoints/weights on the fly.
+
+	This header is intentionally separate from NDGITile.ush: the training
+	shaders still use the BC-simulation layout and must not see these texture
+	bindings.
+============================================================================*/
+
+#pragma once
+
+#include "NDGIMLP.ush"
+
+struct NDGICompactTileParameters
+{
+	uint UVSize;
+	uint UVTSize;
+	uint UTSize;
+	uint VTSize;
+	uint TimeSlices;
+	uint MLPOffset;
+	uint UTOffset;
+	uint VTOffset;
+};
+
+// Mirrored (reflect-101) texel addressing, matching the training sampler.
+int NDGICompactMirrorIndex(int Index, int Size)
+{
+	if (Size <= 1)
+	{
+		return 0;
+	}
+	if (Index < 0)
+	{
+		return -Index;
+	}
+	if (Index >= Size)
+	{
+		return 2 * Size - 2 - Index;
+	}
+	return Index;
+}
+
+void NDGICompactBilinearTaps(float Coordinate, uint Size, out uint X0, out uint X1, out float W0, out float W1)
+{
+	float C = Coordinate * (float)Size - 0.5;
+	float FloorC = floor(C);
+	float F = C - FloorC;
+	int I = (int)FloorC;
+	X0 = (uint)NDGICompactMirrorIndex(I, (int)Size);
+	X1 = (uint)NDGICompactMirrorIndex(I + 1, (int)Size);
+	W0 = 1.0 - F;
+	W1 = F;
+}
+
+void NDGICompactTemporalTaps(float Time, uint Slices, out uint T0, out uint T1, out float W0, out float W1)
+{
+	float C = Time * (float)(Slices - 1);
+	float FloorC = floor(C);
+	float F = C - FloorC;
+	int I = (int)FloorC;
+	T0 = (uint)clamp(I, 0, (int)Slices - 1);
+	T1 = (uint)clamp(I + 1, 0, (int)Slices - 1);
+	W0 = 1.0 - F;
+	W1 = F;
+}
+
+float4 NDGILoadFeatureUV(Texture2DArray<float4> Texture, uint X, uint Y, uint Layer)
+{
+	return Texture.Load(int4((int)X, (int)Y, (int)Layer, 0));
+}
+
+float4 NDGILoadFeatureUVT(Texture2DArray<float4> Texture, uint X, uint Y, uint Layer)
+{
+	return Texture.Load(int4((int)X, (int)Y, (int)Layer, 0));
+}
+
+float NDGICompactUTTexel(uint Base, NDGICompactTileParameters C, StructuredBuffer<float> P, uint X, uint T, uint Channel)
+{
+	return clamp(P[Base + C.UTOffset + (T * C.UTSize + X) * 2 + Channel], 0.0, 1.0);
+}
+
+float NDGICompactVTTexel(uint Base, NDGICompactTileParameters C, StructuredBuffer<float> P, uint X, uint T, uint Channel)
+{
+	return clamp(P[Base + C.VTOffset + (T * C.VTSize + X) * 2 + Channel], 0.0, 1.0);
+}
+
+void NDGICompactSampleTile(
+	uint Base,
+	NDGICompactTileParameters C,
+	StructuredBuffer<float> P,
+	Texture2DArray<float4> FeatureUV,
+	Texture2DArray<float4> FeatureUVT,
+	uint ModelSlot,
+	float U, float V, float Time,
+	out float Vuv[4], out float Vut[2], out float Vvt[2], out float Vuvt[4])
+{
+	uint UVX0, UVX1, UVY0, UVY1;
+	float UVWX0, UVWX1, UVWY0, UVWY1;
+	NDGICompactBilinearTaps(U, C.UVSize, UVX0, UVX1, UVWX0, UVWX1);
+	NDGICompactBilinearTaps(V, C.UVSize, UVY0, UVY1, UVWY0, UVWY1);
+	float4 UVSample =
+		UVWX0 * UVWY0 * NDGILoadFeatureUV(FeatureUV, UVX0, UVY0, ModelSlot)
+		+ UVWX1 * UVWY0 * NDGILoadFeatureUV(FeatureUV, UVX1, UVY0, ModelSlot)
+		+ UVWX0 * UVWY1 * NDGILoadFeatureUV(FeatureUV, UVX0, UVY1, ModelSlot)
+		+ UVWX1 * UVWY1 * NDGILoadFeatureUV(FeatureUV, UVX1, UVY1, ModelSlot);
+	Vuv[0] = UVSample.x;
+	Vuv[1] = UVSample.y;
+	Vuv[2] = UVSample.z;
+	Vuv[3] = UVSample.w;
+
+	uint TT0, TT1;
+	float TTW0, TTW1;
+	NDGICompactTemporalTaps(Time, C.TimeSlices, TT0, TT1, TTW0, TTW1);
+
+	uint UVTX0, UVTX1, UVTY0, UVTY1;
+	float UVTWX0, UVTWX1, UVTWY0, UVTWY1;
+	NDGICompactBilinearTaps(U, C.UVTSize, UVTX0, UVTX1, UVTWX0, UVTWX1);
+	NDGICompactBilinearTaps(V, C.UVTSize, UVTY0, UVTY1, UVTWY0, UVTWY1);
+	const uint SliceLayer0 = ModelSlot * C.TimeSlices + TT0;
+	const uint SliceLayer1 = ModelSlot * C.TimeSlices + TT1;
+
+	float4 UVT0 =
+		UVTWX0 * UVTWY0 * NDGILoadFeatureUVT(FeatureUVT, UVTX0, UVTY0, SliceLayer0)
+		+ UVTWX1 * UVTWY0 * NDGILoadFeatureUVT(FeatureUVT, UVTX1, UVTY0, SliceLayer0)
+		+ UVTWX0 * UVTWY1 * NDGILoadFeatureUVT(FeatureUVT, UVTX0, UVTY1, SliceLayer0)
+		+ UVTWX1 * UVTWY1 * NDGILoadFeatureUVT(FeatureUVT, UVTX1, UVTY1, SliceLayer0);
+	float4 UVT1 =
+		UVTWX0 * UVTWY0 * NDGILoadFeatureUVT(FeatureUVT, UVTX0, UVTY0, SliceLayer1)
+		+ UVTWX1 * UVTWY0 * NDGILoadFeatureUVT(FeatureUVT, UVTX1, UVTY0, SliceLayer1)
+		+ UVTWX0 * UVTWY1 * NDGILoadFeatureUVT(FeatureUVT, UVTX0, UVTY1, SliceLayer1)
+		+ UVTWX1 * UVTWY1 * NDGILoadFeatureUVT(FeatureUVT, UVTX1, UVTY1, SliceLayer1);
+	float4 UVTSample = TTW0 * UVT0 + TTW1 * UVT1;
+	Vuvt[0] = UVTSample.x;
+	Vuvt[1] = UVTSample.y;
+	Vuvt[2] = UVTSample.z;
+	Vuvt[3] = UVTSample.w;
+
+	uint UTX0, UTX1, UTT0, UTT1;
+	float UTWX0, UTWX1, UTWT0, UTWT1;
+	NDGICompactBilinearTaps(U, C.UTSize, UTX0, UTX1, UTWX0, UTWX1);
+	NDGICompactTemporalTaps(Time, C.TimeSlices, UTT0, UTT1, UTWT0, UTWT1);
+	for (uint c = 0; c < 2; ++c)
+	{
+		Vut[c] = UTWT0 * (UTWX0 * NDGICompactUTTexel(Base, C, P, UTX0, UTT0, c)
+			+ UTWX1 * NDGICompactUTTexel(Base, C, P, UTX1, UTT0, c))
+			+ UTWT1 * (UTWX0 * NDGICompactUTTexel(Base, C, P, UTX0, UTT1, c)
+			+ UTWX1 * NDGICompactUTTexel(Base, C, P, UTX1, UTT1, c));
+	}
+
+	uint VTX0, VTX1, VTT0, VTT1;
+	float VTWX0, VTWX1, VTWT0, VTWT1;
+	NDGICompactBilinearTaps(V, C.VTSize, VTX0, VTX1, VTWX0, VTWX1);
+	NDGICompactTemporalTaps(Time, C.TimeSlices, VTT0, VTT1, VTWT0, VTWT1);
+	for (uint c2 = 0; c2 < 2; ++c2)
+	{
+		Vvt[c2] = VTWT0 * (VTWX0 * NDGICompactVTTexel(Base, C, P, VTX0, VTT0, c2)
+			+ VTWX1 * NDGICompactVTTexel(Base, C, P, VTX1, VTT0, c2))
+			+ VTWT1 * (VTWX0 * NDGICompactVTTexel(Base, C, P, VTX0, VTT1, c2)
+			+ VTWX1 * NDGICompactVTTexel(Base, C, P, VTX1, VTT1, c2));
+	}
+}

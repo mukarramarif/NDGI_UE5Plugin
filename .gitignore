@@ -1,0 +1,23 @@
+# Unreal Engine build output
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+Platforms/
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.VC.db
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.xcodeproj
+*.xcworkspace
+
+# OS
+.DS_Store
+Thumbs.db

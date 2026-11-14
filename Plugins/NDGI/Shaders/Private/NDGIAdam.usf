@@ -1,0 +1,59 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGIAdam.usf
+	Adam update over the flat per-tile parameter layout. Also consumes (reads and
+	clears) the fixed-point gradient buffer, so no separate clear pass is needed.
+
+	Feature parameters (index >= NumMLPParameters within a tile) are clamped to
+	[0, 1]; MLP parameters are unbounded.
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+#include "NDGITile.ush"
+
+RWStructuredBuffer<float> TileParameters;
+RWStructuredBuffer<float> MomentsM;
+RWStructuredBuffer<float> MomentsV;
+RWStructuredBuffer<int> GradientInt;
+
+uint NumElements;
+uint TotalParams;
+uint NumMLPParameters;
+float LearningRate;
+float Beta1;
+float Beta2;
+float BetaCorrection1;
+float BetaCorrection2;
+float Epsilon;
+
+[numthreads(64, 1, 1)]
+void AdamCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumElements)
+	{
+		return;
+	}
+
+	const float Grad = (float)GradientInt[Index] / NDGI_GRAD_SCALE;
+	GradientInt[Index] = 0;
+
+	float M = MomentsM[Index];
+	float V = MomentsV[Index];
+	M = Beta1 * M + (1.0 - Beta1) * Grad;
+	V = Beta2 * V + (1.0 - Beta2) * Grad * Grad;
+
+	const float MHat = M / BetaCorrection1;
+	const float VHat = V / BetaCorrection2;
+
+	float Parameter = TileParameters[Index] - LearningRate * MHat / (sqrt(VHat) + Epsilon);
+	if ((Index % TotalParams) >= NumMLPParameters)
+	{
+		Parameter = clamp(Parameter, 0.0, 1.0);
+	}
+
+	TileParameters[Index] = Parameter;
+	MomentsM[Index] = M;
+	MomentsV[Index] = V;
+}

@@ -1,0 +1,298 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGITile.ush
+	Device-side tile parameter layout, sampling and gradient scatter for NDGI.
+
+	The flat per-tile parameter layout is the contract shared by the CPU tile
+	reference (NDGI::Reference::FTileReference) and every GPU kernel:
+
+		[0]                                  MLP (646)
+		[MLPOffset]                          F_uv  E1 (UVBlocks * 4)
+		[UVE2Offset]                         F_uv  E2
+		[UVWOffset]                          F_uv  W  (UVBlocks * 16)
+		[UVTE1Offset]                        F_uvt E1 (TimeSlices * UVTBlocks * 4)
+		[UVTE2Offset]                        F_uvt E2
+		[UVTWOffset]                         F_uvt W
+		[UTOffset]                           F_ut raw (UTSize * TimeSlices * 2)
+		[VTOffset]                           F_vt raw (VTSize * TimeSlices * 2)
+
+	All feature parameters live in [0, 1]; only the MLP parameters are unbounded.
+=============================================================================*/
+
+#pragma once
+
+#include "NDGIMLP.ush"
+
+#define NDGI_GRAD_SCALE 1048576.0
+
+struct NDGITileParameters
+{
+	uint UVSize;
+	uint UVTSize;
+	uint UTSize;
+	uint VTSize;
+	uint TimeSlices;
+	uint UVBlocksX;
+	uint UVTBlocksX;
+	uint MLPOffset;
+	uint UVE1Offset;
+	uint UVE2Offset;
+	uint UVWOffset;
+	uint UVTE1Offset;
+	uint UVTE2Offset;
+	uint UVTWOffset;
+	uint UTOffset;
+	uint VTOffset;
+	uint TotalParams;
+};
+
+struct NDGITileTaps
+{
+	uint UVX0, UVY0, UVX1, UVY1;
+	float UVW00, UVW10, UVW01, UVW11;
+
+	uint UTX0, UTT0, UTX1, UTT1;
+	float UTW00, UTW10, UTW01, UTW11;
+
+	uint VTX0, VTT0, VTX1, VTT1;
+	float VTW00, VTW10, VTW01, VTW11;
+
+	uint UVTX0, UVTY0, UVTX1, UVTY1, UVTT0, UVTT1;
+	float UVTWX0, UVTWX1, UVTWY0, UVTWY1;
+	float UVTWT0, UVTWT1;
+};
+
+// Mirrored (reflect-101) texel addressing so tiles match at their borders
+// (paper Section 9: mirrored padding during training).
+int NDGIMirrorIndex(int Index, int Size)
+{
+	if (Size <= 1)
+	{
+		return 0;
+	}
+	if (Index < 0)
+	{
+		return -Index;
+	}
+	if (Index >= Size)
+	{
+		return 2 * Size - 2 - Index;
+	}
+	return Index;
+}
+
+void NDGIBilinearTaps(float Coordinate, uint Size, out uint X0, out uint X1, out float W0, out float W1)
+{
+	float C = Coordinate * (float)Size - 0.5;
+	float FloorC = floor(C);
+	float F = C - FloorC;
+	int I = (int)FloorC;
+	X0 = (uint)NDGIMirrorIndex(I, (int)Size);
+	X1 = (uint)NDGIMirrorIndex(I + 1, (int)Size);
+	W0 = 1.0 - F;
+	W1 = F;
+}
+
+void NDGITemporalTaps(float Time, uint Slices, out uint T0, out uint T1, out float W0, out float W1)
+{
+	float C = Time * (float)(Slices - 1);
+	float FloorC = floor(C);
+	float F = C - FloorC;
+	int I = (int)FloorC;
+	T0 = (uint)clamp(I, 0, (int)Slices - 1);
+	T1 = (uint)clamp(I + 1, 0, (int)Slices - 1);
+	W0 = 1.0 - F;
+	W1 = F;
+}
+
+float NDMUVTexel(uint Base, NDGITileParameters C, StructuredBuffer<float> P, uint X, uint Y, uint Channel)
+{
+	uint Block = (Y / 4) * C.UVBlocksX + (X / 4);
+	uint P4 = (Y % 4) * 4 + (X % 4);
+	float W = P[Base + C.UVWOffset + Block * 16 + P4];
+	float E1 = P[Base + C.UVE1Offset + Block * 4 + Channel];
+	float E2 = P[Base + C.UVE2Offset + Block * 4 + Channel];
+	return (1.0 - W) * E1 + W * E2;
+}
+
+float NDMUVTTexel(uint Base, NDGITileParameters C, StructuredBuffer<float> P, uint Slice, uint X, uint Y, uint Channel)
+{
+	uint BlocksPerSlice = C.UVTBlocksX * C.UVTBlocksX;
+	uint GlobalBlock = Slice * BlocksPerSlice + (Y / 4) * C.UVTBlocksX + (X / 4);
+	uint P4 = (Y % 4) * 4 + (X % 4);
+	float W = P[Base + C.UVTWOffset + GlobalBlock * 16 + P4];
+	float E1 = P[Base + C.UVTE1Offset + GlobalBlock * 4 + Channel];
+	float E2 = P[Base + C.UVTE2Offset + GlobalBlock * 4 + Channel];
+	return (1.0 - W) * E1 + W * E2;
+}
+
+float NDMUTTexel(uint Base, NDGITileParameters C, StructuredBuffer<float> P, uint X, uint T, uint Channel)
+{
+	return clamp(P[Base + C.UTOffset + (T * C.UTSize + X) * 2 + Channel], 0.0, 1.0);
+}
+
+float NDMVTTexel(uint Base, NDGITileParameters C, StructuredBuffer<float> P, uint X, uint T, uint Channel)
+{
+	return clamp(P[Base + C.VTOffset + (T * C.VTSize + X) * 2 + Channel], 0.0, 1.0);
+}
+
+void NDGISampleTile(
+	uint Base,
+	NDGITileParameters C,
+	StructuredBuffer<float> P,
+	float U, float V, float Time,
+	out float Vuv[4], out float Vut[2], out float Vvt[2], out float Vuvt[4],
+	out NDGITileTaps Taps)
+{
+	NDGIBilinearTaps(U, C.UVSize, Taps.UVX0, Taps.UVX1, Taps.UVW00, Taps.UVW10);
+	NDGIBilinearTaps(V, C.UVSize, Taps.UVY0, Taps.UVY1, Taps.UVW01, Taps.UVW11);
+	for (uint c = 0; c < 4; ++c)
+	{
+		Vuv[c] = Taps.UVW00 * NDMUVTexel(Base, C, P, Taps.UVX0, Taps.UVY0, c)
+			+ Taps.UVW10 * NDMUVTexel(Base, C, P, Taps.UVX1, Taps.UVY0, c)
+			+ Taps.UVW01 * NDMUVTexel(Base, C, P, Taps.UVX0, Taps.UVY1, c)
+			+ Taps.UVW11 * NDMUVTexel(Base, C, P, Taps.UVX1, Taps.UVY1, c);
+	}
+
+	NDGIBilinearTaps(U, C.UTSize, Taps.UTX0, Taps.UTX1, Taps.UTW00, Taps.UTW10);
+	NDGITemporalTaps(Time, C.TimeSlices, Taps.UTT0, Taps.UTT1, Taps.UTW01, Taps.UTW11);
+	for (uint c2 = 0; c2 < 2; ++c2)
+	{
+		Vut[c2] = Taps.UTW00 * NDMUTTexel(Base, C, P, Taps.UTX0, Taps.UTT0, c2)
+			+ Taps.UTW10 * NDMUTTexel(Base, C, P, Taps.UTX1, Taps.UTT0, c2)
+			+ Taps.UTW01 * NDMUTTexel(Base, C, P, Taps.UTX0, Taps.UTT1, c2)
+			+ Taps.UTW11 * NDMUTTexel(Base, C, P, Taps.UTX1, Taps.UTT1, c2);
+	}
+
+	NDGIBilinearTaps(V, C.VTSize, Taps.VTX0, Taps.VTX1, Taps.VTW00, Taps.VTW10);
+	NDGITemporalTaps(Time, C.TimeSlices, Taps.VTT0, Taps.VTT1, Taps.VTW01, Taps.VTW11);
+	for (uint c3 = 0; c3 < 2; ++c3)
+	{
+		Vvt[c3] = Taps.VTW00 * NDMVTTexel(Base, C, P, Taps.VTX0, Taps.VTT0, c3)
+			+ Taps.VTW10 * NDMVTTexel(Base, C, P, Taps.VTX1, Taps.VTT0, c3)
+			+ Taps.VTW01 * NDMVTTexel(Base, C, P, Taps.VTX0, Taps.VTT1, c3)
+			+ Taps.VTW11 * NDMVTTexel(Base, C, P, Taps.VTX1, Taps.VTT1, c3);
+	}
+
+	NDGIBilinearTaps(U, C.UVTSize, Taps.UVTX0, Taps.UVTX1, Taps.UVTWX0, Taps.UVTWX1);
+	NDGIBilinearTaps(V, C.UVTSize, Taps.UVTY0, Taps.UVTY1, Taps.UVTWY0, Taps.UVTWY1);
+	NDGITemporalTaps(Time, C.TimeSlices, Taps.UVTT0, Taps.UVTT1, Taps.UVTWT0, Taps.UVTWT1);
+	const float W00 = Taps.UVTWX0 * Taps.UVTWY0;
+	const float W10 = Taps.UVTWX1 * Taps.UVTWY0;
+	const float W01 = Taps.UVTWX0 * Taps.UVTWY1;
+	const float W11 = Taps.UVTWX1 * Taps.UVTWY1;
+	for (uint c4 = 0; c4 < 4; ++c4)
+	{
+		const float B0 = W00 * NDMUVTTexel(Base, C, P, Taps.UVTT0, Taps.UVTX0, Taps.UVTY0, c4)
+			+ W10 * NDMUVTTexel(Base, C, P, Taps.UVTT0, Taps.UVTX1, Taps.UVTY0, c4)
+			+ W01 * NDMUVTTexel(Base, C, P, Taps.UVTT0, Taps.UVTX0, Taps.UVTY1, c4)
+			+ W11 * NDMUVTTexel(Base, C, P, Taps.UVTT0, Taps.UVTX1, Taps.UVTY1, c4);
+		const float B1 = W00 * NDMUVTTexel(Base, C, P, Taps.UVTT1, Taps.UVTX0, Taps.UVTY0, c4)
+			+ W10 * NDMUVTTexel(Base, C, P, Taps.UVTT1, Taps.UVTX1, Taps.UVTY0, c4)
+			+ W01 * NDMUVTTexel(Base, C, P, Taps.UVTT1, Taps.UVTX0, Taps.UVTY1, c4)
+			+ W11 * NDMUVTTexel(Base, C, P, Taps.UVTT1, Taps.UVTX1, Taps.UVTY1, c4);
+		Vuvt[c4] = Taps.UVTWT0 * B0 + Taps.UVTWT1 * B1;
+	}
+}
+
+void NDMAtomicAddScale(RWStructuredBuffer<int> GradientInt, uint Index, float Value)
+{
+	InterlockedAdd(GradientInt[Index], (int)round(Value * NDGI_GRAD_SCALE));
+}
+
+/** Scatters dV for F_uv through its bilinear taps into the BC-simulation gradient atomics. */
+void NDMScatterUV(uint Base, NDGITileParameters C, StructuredBuffer<float> P, RWStructuredBuffer<int> G, NDGITileTaps Taps, float DV[4])
+{
+	uint Xs[4] = { Taps.UVX0, Taps.UVX1, Taps.UVX0, Taps.UVX1 };
+	uint Ys[4] = { Taps.UVY0, Taps.UVY0, Taps.UVY1, Taps.UVY1 };
+	float Ws[4] = { Taps.UVW00, Taps.UVW10, Taps.UVW01, Taps.UVW11 };
+	[loop]
+	for (uint Tap = 0; Tap < 4; ++Tap)
+	{
+		const uint X = Xs[Tap];
+		const uint Y = Ys[Tap];
+		const float TapWeight = Ws[Tap];
+		const uint Block = (Y / 4) * C.UVBlocksX + (X / 4);
+		const uint P4 = (Y % 4) * 4 + (X % 4);
+		const float W = P[Base + C.UVWOffset + Block * 16 + P4];
+		float DW = 0.0;
+		for (uint c = 0; c < 4; ++c)
+		{
+			const float DF = TapWeight * DV[c];
+			const float E1 = P[Base + C.UVE1Offset + Block * 4 + c];
+			const float E2 = P[Base + C.UVE2Offset + Block * 4 + c];
+			NDMAtomicAddScale(G, Base + C.UVE1Offset + Block * 4 + c, (1.0 - W) * DF);
+			NDMAtomicAddScale(G, Base + C.UVE2Offset + Block * 4 + c, W * DF);
+			DW += DF * (E2 - E1);
+		}
+		NDMAtomicAddScale(G, Base + C.UVWOffset + Block * 16 + P4, DW);
+	}
+}
+
+void NDMScatterUVT(uint Base, NDGITileParameters C, StructuredBuffer<float> P, RWStructuredBuffer<int> G, NDGITileTaps Taps, float DV[4])
+{
+	uint Xs[4] = { Taps.UVTX0, Taps.UVTX1, Taps.UVTX0, Taps.UVTX1 };
+	uint Ys[4] = { Taps.UVTY0, Taps.UVTY0, Taps.UVTY1, Taps.UVTY1 };
+	float Ws[4] = { Taps.UVTWX0 * Taps.UVTWY0, Taps.UVTWX1 * Taps.UVTWY0, Taps.UVTWX0 * Taps.UVTWY1, Taps.UVTWX1 * Taps.UVTWY1 };
+	uint Slices[2] = { Taps.UVTT0, Taps.UVTT1 };
+	float TemporalWeights[2] = { Taps.UVTWT0, Taps.UVTWT1 };
+	const uint BlocksPerSlice = C.UVTBlocksX * C.UVTBlocksX;
+	[loop]
+	for (uint SliceTap = 0; SliceTap < 2; ++SliceTap)
+	{
+		const uint Slice = Slices[SliceTap];
+		const float TemporalWeight = TemporalWeights[SliceTap];
+		[loop]
+		for (uint Tap = 0; Tap < 4; ++Tap)
+		{
+			const uint X = Xs[Tap];
+			const uint Y = Ys[Tap];
+			const float TapWeight = Ws[Tap] * TemporalWeight;
+			const uint GlobalBlock = Slice * BlocksPerSlice + (Y / 4) * C.UVTBlocksX + (X / 4);
+			const uint P4 = (Y % 4) * 4 + (X % 4);
+			const float W = P[Base + C.UVTWOffset + GlobalBlock * 16 + P4];
+			float DW = 0.0;
+			for (uint c = 0; c < 4; ++c)
+			{
+				const float DF = TapWeight * DV[c];
+				const float E1 = P[Base + C.UVTE1Offset + GlobalBlock * 4 + c];
+				const float E2 = P[Base + C.UVTE2Offset + GlobalBlock * 4 + c];
+				NDMAtomicAddScale(G, Base + C.UVTE1Offset + GlobalBlock * 4 + c, (1.0 - W) * DF);
+				NDMAtomicAddScale(G, Base + C.UVTE2Offset + GlobalBlock * 4 + c, W * DF);
+				DW += DF * (E2 - E1);
+			}
+			NDMAtomicAddScale(G, Base + C.UVTWOffset + GlobalBlock * 16 + P4, DW);
+		}
+	}
+}
+
+void NDMScatterUT(uint Base, NDGITileParameters C, RWStructuredBuffer<int> G, NDGITileTaps Taps, float DV[2])
+{
+	uint Xs[4] = { Taps.UTX0, Taps.UTX1, Taps.UTX0, Taps.UTX1 };
+	uint Ts[4] = { Taps.UTT0, Taps.UTT0, Taps.UTT1, Taps.UTT1 };
+	float Ws[4] = { Taps.UTW00, Taps.UTW10, Taps.UTW01, Taps.UTW11 };
+	[loop]
+	for (uint Tap = 0; Tap < 4; ++Tap)
+	{
+		for (uint c = 0; c < 2; ++c)
+		{
+			NDMAtomicAddScale(G, Base + C.UTOffset + (Ts[Tap] * C.UTSize + Xs[Tap]) * 2 + c, Ws[Tap] * DV[c]);
+		}
+	}
+}
+
+void NDMScatterVT(uint Base, NDGITileParameters C, RWStructuredBuffer<int> G, NDGITileTaps Taps, float DV[2])
+{
+	uint Xs[4] = { Taps.VTX0, Taps.VTX1, Taps.VTX0, Taps.VTX1 };
+	uint Ts[4] = { Taps.VTT0, Taps.VTT0, Taps.VTT1, Taps.VTT1 };
+	float Ws[4] = { Taps.VTW00, Taps.VTW10, Taps.VTW01, Taps.VTW11 };
+	[loop]
+	for (uint Tap = 0; Tap < 4; ++Tap)
+	{
+		for (uint c = 0; c < 2; ++c)
+		{
+			NDMAtomicAddScale(G, Base + C.VTOffset + (Ts[Tap] * C.VTSize + Xs[Tap]) * 2 + c, Ws[Tap] * DV[c]);
+		}
+	}
+}

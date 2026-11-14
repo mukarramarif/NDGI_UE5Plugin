@@ -1,0 +1,40 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "NDGI",
+	"Description": "Neural Dynamic GI: editor-side training and runtime decoding of temporal lightmaps (arXiv 2604.12625)",
+	"Category": "Other",
+	"CreatedBy": "Muhammad Mukarram Arif",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "GPULightmass",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "NDGIRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "NDGI",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "NDGIEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

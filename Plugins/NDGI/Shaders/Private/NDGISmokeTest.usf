@@ -1,0 +1,22 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGISmokeTest.usf
+	Phase 0 smoke test for the NDGI compute dispatch path.
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+
+RWStructuredBuffer<uint> OutputBuffer;
+uint Count;
+uint Offset;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadId.x;
+	if (Index < Count)
+	{
+		OutputBuffer[Index] = Index * 2u + Offset;
+	}
+}

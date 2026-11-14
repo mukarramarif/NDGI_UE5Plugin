@@ -1,0 +1,99 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	NDGIDecodeTexture.usf
+	Decodes a tile into a 2D render target for editor previewing. Same sampling
+	and MLP code as training / runtime decode.
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+#include "NDGIMLP.ush"
+#include "NDGITile.ush"
+
+StructuredBuffer<float> TileParameters;
+RWTexture2D<float4> OutputTexture;
+
+// NDGITileParameters include members (bound by bare leaf names).
+uint UVSize;
+uint UVTSize;
+uint UTSize;
+uint VTSize;
+uint TimeSlices;
+uint UVBlocksX;
+uint UVTBlocksX;
+uint MLPOffset;
+uint UVE1Offset;
+uint UVE2Offset;
+uint UVWOffset;
+uint UVTE1Offset;
+uint UVTE2Offset;
+uint UVTWOffset;
+uint UTOffset;
+uint VTOffset;
+uint TotalParams;
+
+uint OutputWidth;
+uint OutputHeight;
+float Time;
+float3 MeanRGB;
+float Gamma;
+uint TileIndex;
+
+[numthreads(8, 8, 1)]
+void DecodeTextureCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= OutputWidth || DispatchThreadId.y >= OutputHeight)
+	{
+		return;
+	}
+
+	NDGITileParameters TileParams;
+	TileParams.UVSize = UVSize;
+	TileParams.UVTSize = UVTSize;
+	TileParams.UTSize = UTSize;
+	TileParams.VTSize = VTSize;
+	TileParams.TimeSlices = TimeSlices;
+	TileParams.UVBlocksX = UVBlocksX;
+	TileParams.UVTBlocksX = UVTBlocksX;
+	TileParams.MLPOffset = MLPOffset;
+	TileParams.UVE1Offset = UVE1Offset;
+	TileParams.UVE2Offset = UVE2Offset;
+	TileParams.UVWOffset = UVWOffset;
+	TileParams.UVTE1Offset = UVTE1Offset;
+	TileParams.UVTE2Offset = UVTE2Offset;
+	TileParams.UVTWOffset = UVTWOffset;
+	TileParams.UTOffset = UTOffset;
+	TileParams.VTOffset = VTOffset;
+	TileParams.TotalParams = TotalParams;
+
+	const uint Base = TileIndex * TileParams.TotalParams;
+	const float U = (DispatchThreadId.x + 0.5) / OutputWidth;
+	const float V = (DispatchThreadId.y + 0.5) / OutputHeight;
+
+	float Vuv[4], Vut[2], Vvt[2], Vuvt[4];
+	NDGITileTaps Taps;
+	NDGISampleTile(Base, TileParams, TileParameters, U, V, Time, Vuv, Vut, Vvt, Vuvt, Taps);
+
+	float Input[NDGI_INPUT_DIM];
+	[unroll]
+	for (uint c = 0; c < 4; ++c)
+	{
+		Input[c] = Vuv[c];
+		Input[8 + c] = Vuvt[c];
+	}
+	Input[4] = Vut[0];
+	Input[5] = Vut[1];
+	Input[6] = Vvt[0];
+	Input[7] = Vvt[1];
+	Input[12] = sin(2.0 * PI * Time);
+	Input[13] = cos(2.0 * PI * Time);
+	Input[14] = sin(4.0 * PI * Time);
+	Input[15] = cos(4.0 * PI * Time);
+
+	NDGIMLPForwardCache Cache;
+	NDGIMLPForward(Base + TileParams.MLPOffset, TileParameters, Input, Cache);
+
+	const float3 Normalized = float3(Cache.Output[0], Cache.Output[1], Cache.Output[2]);
+	const float3 Linear = pow(max(Normalized + MeanRGB, 0.0), Gamma);
+	OutputTexture[DispatchThreadId.xy] = float4(Linear, 1.0);
+}
