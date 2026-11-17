@@ -414,7 +414,6 @@ Runtime cache controls:
 - CPU Lightmass is the supported bake path. `ndgi.BakeTOD ... gpu` exists but currently produces no lightmaps.
 - No external ML runtime is required. The MLP, gradients, Adam, and BC simulation are hand-written USF shader code; the plugin does not depend on PyTorch, ONNX, Unreal NNE, or a generic tensor runtime.
 - Use at least 3 time steps (2-step bakes produce the same sun pitch twice). 8 steps is the production default.
-- Close the Unreal Editor before rebuilding the plugin; Live Coding blocks UnrealBuildTool.
 
 ## Quick Start
 
@@ -600,7 +599,7 @@ pre-BC7 level asset can no longer produce a misleading pass.
 
 Use `r.ScreenPercentage <n>` for GPU-bound measurements; a `-ResX` larger than the desktop may be clamped by the window manager.
 
-## Shipping and CI
+## Shipping and CI (still in development)
 
 ### Packaged DX12 build + smoke test
 
