@@ -1,3 +1,11 @@
+
+
+https://github.com/user-attachments/assets/479d22eb-eb27-4a96-a2f9-430962d2e83e
+
+
+
+https://github.com/user-attachments/assets/53bc1d5f-023e-4adb-adc2-26468e24bfba
+
 # NDGI — Neural Dynamic GI
 
 NDGI (Neural Dynamic GI) replaces the lighting stored in a level's lightmaps with per-tile MLP weight sets trained from a multi-step lighting bake. At runtime, `ANDGIActor` evaluates those weights with a hand-written USF compute shader and writes the result back into the engine's uncompressed lightmaps (RGB in coefficient 0, directional SH in coefficient 1), so static geometry keeps baked-lighting cost while the character still receives real-time directional shadows.
