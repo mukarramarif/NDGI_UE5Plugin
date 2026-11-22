@@ -1,16 +1,36 @@
+# NDGI — Neural Dynamic GI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Unreal Engine 5.8](https://img.shields.io/badge/Unreal%20Engine-5.8-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+
+**Neural Dynamic GI for Unreal Engine 5 — temporal lightmaps compressed into per-tile MLPs trained in compute shaders. No PyTorch, no ONNX, no Unreal NNE. 45 dB PSNR, ~6 ms decode.**
+
+NDGI implements the CVPR 2026 paper [*Neural Dynamic GI: Random-Access Neural Compression for Temporal Lightmaps in Dynamic Lighting Environments*](https://arxiv.org/pdf/2604.12625) (Wu et al.) as a UE5 plugin. It replaces the lighting stored in a level's lightmaps with per-tile MLP weight sets trained from a multi-step lighting bake. At runtime, `ANDGIActor` evaluates those weights with a hand-written USF compute shader and writes the result back into the engine's uncompressed lightmaps (RGB in coefficient 0, directional SH in coefficient 1), so static geometry keeps baked-lighting cost while the character still receives real-time directional shadows.
+
+## Demo
+
+**Time-of-day cycle on the test map** — dusk to daylight and back, decoded live by NDGI (`NDGITestBakeMap_WP`):
 
 https://github.com/user-attachments/assets/479d22eb-eb27-4a96-a2f9-430962d2e83e
 
-
+**Time-of-day sweep on the Sky Temple demo level** — warm daylight fading to dusk, baked lightmaps relit by NDGI:
 
 https://github.com/user-attachments/assets/53bc1d5f-023e-4adb-adc2-26468e24bfba
 
-# NDGI — Neural Dynamic GI
+## Results
 
-NDGI (Neural Dynamic GI) replaces the lighting stored in a level's lightmaps with per-tile MLP weight sets trained from a multi-step lighting bake. At runtime, `ANDGIActor` evaluates those weights with a hand-written USF compute shader and writes the result back into the engine's uncompressed lightmaps (RGB in coefficient 0, directional SH in coefficient 1), so static geometry keeps baked-lighting cost while the character still receives real-time directional shadows.
+| Metric | NDGI | Conditions |
+|---|---|---|
+| Per-tile PSNR | **45.06 dB** avg | 512×512 test atlas, 8 slices, 16-wide MLP, tile 64, overlap 8, 30,000 steps |
+| Directional SH reconstruction | **28.20 dB** | Same test atlas |
+| Live runtime decode | **p50 5.50 ms / p95 6.08 ms** | 19 atlases, 578 models, 67.3 MB params, 1920×1080, AMD RX 9070 XT |
+| BC7 feature storage | **2.66× vs raw RGBA8**, **30.30× vs raw 8-slice set**, **2.11 BPP** | 4 models, tile 64, overlap 8, 8 slices |
+| Game-thread enqueue | ~0.02 ms | Cached decode |
 
-> **No external ML framework.** NDGI does not use PyTorch, ONNX, Unreal NNE, or a generic tensor/autograd runtime. The paper's tiny MLP is reimplemented directly in USF compute shaders: `NDGIMLP.ush` contains the forward and backward passes, `NDGITrainTile.usf` contains the training step and gradient scatter, and `NDGIDecodeAtlas.usf` contains runtime inference. C++ orchestrates buffers, dispatches, and asset I/O. The CPU implementation in `NDGIReference.cpp` is only a test oracle. “Simulated” here means the model is explicit shader arithmetic, not that the optimization is fake — Adam really updates the weights and feature maps.
+For reference, the paper reports 46.7 dB PSNR at 0.68 BPP, measured on its own scenes and metric — not directly comparable to the numbers above, but the same order of quality at a small fraction of the storage of raw lightmap sets.
+
+> **No external ML framework.** NDGI does not use PyTorch, ONNX, Unreal NNE, or a generic tensor/autograd runtime. The paper's tiny MLP is reimplemented directly in USF compute shaders: `NDGIMLP.ush` contains the forward and backward passes, `NDGITrainTile.usf` contains the training step and gradient scatter, and `NDGIDecodeAtlas.usf` contains runtime inference. C++ orchestrates buffers, dispatches, and asset I/O. The CPU implementation in `NDGIReference.cpp` is only a test oracle. "Simulated" here means the model is explicit shader arithmetic, not that the optimization is fake — Adam really updates the weights and feature maps.
 
 Each tile model has six outputs: normalized RGB followed by signed SH.xyz. SH is mean-normalized without gamma (coefficients can be negative). Bake exports are `.ndgi` v3. Version 3 adds the per-component lightmap encoding range map; v1/v2 files still load, but without that map regions whose components use different HQ ranges can be decoded incorrectly, so **retrain every atlas after updating from an older pipeline**. Models trained before the SH change (595-parameter MLP) are incompatible with the 646-parameter MLP and must be retrained.
 
@@ -775,3 +795,4 @@ $Project = "C:\path\to\RPG_Prototype.uproject"
 - The dynamic benchmark map strips all component lightmap data and sets `bForceNoPrecomputedLighting`; re-run `ndgi.SetupBenchmarkMaps` if the source level changes.
 - World Partition smoke test (`/Game/NDGI/NDGITestBakeMap_WP`, extended with a second mesh cluster at X≈40000): `ndgi.BakeTOD 2` force-loaded 18 components, baked 7 static meshes into 2 lightmap atlases, saved the level + build data, and reported `WP spike: PASSED` (2 atlas textures, 1 level with saved build data). This map stores its built data in one monolithic `NDGITestBakeMap_WP_BuiltData` package; per-cell packages and runtime streaming are M3 work.
 - The WP test map was produced by `WorldPartitionConvertCommandlet`; its conversion settings live in `Content/NDGI/NDGITestBakeMap.ini` (test-only).
+
